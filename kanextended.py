@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 
-# advanced operation selector with mlp
 class AdvancedOperationSelector(nn.Module):
     def __init__(self, hidden_dim):
         super(AdvancedOperationSelector, self).__init__()
@@ -18,18 +17,17 @@ class AdvancedOperationSelector(nn.Module):
         x = self.sigmoid(self.fc3(x))
         return x
 
-# kan model with operation selection
 class KANExtended(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim, num_operations=2):
+    def __init__(self, input_dim, output_dim, hidden_dim, num_operations=2, operation_mode='both'):
         super(KANExtended, self).__init__()
         self.num_operations = num_operations
+        self.operation_mode = operation_mode
         
         self.shared_psi_layer = nn.Linear(input_dim, hidden_dim)
         self.output_layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(output_dim)])
         self.phi_layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(output_dim * num_operations)])
-        self.operation_selectors = nn.ModuleList([AdvancedOperationSelector(hidden_dim) for _ in range(output_dim * num_operations)])
-        
-        # final layer to reduce output to scalar
+        self.operation_selectors = nn.ModuleList([AdvancedOperationSelector(hidden_dim) for _ in range(output_dim)])
+
         self.final_layer = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
@@ -38,33 +36,35 @@ class KANExtended(nn.Module):
         
         final_output = 0
         
-        for i, (phi_layer, selector) in enumerate(zip(self.phi_layers, self.operation_selectors)):
-            phi_output = phi_layer(sum_outputs[i % len(sum_outputs)])
-            operation_weight = selector(phi_output)
-            product_term = operation_weight * phi_output
-            sum_term = (1 - operation_weight) * phi_output
+        for i, sum_output in enumerate(sum_outputs):
+            phi_values = [torch.relu(phi_layer(sum_output)) for phi_layer in self.phi_layers[i*self.num_operations:(i+1)*self.num_operations]]
             
-            if i % self.num_operations == 0:
-                combined_output = product_term
-            else:
-                combined_output *= product_term
-                
-            combined_output += sum_term
-            
-            if i % self.num_operations == self.num_operations - 1:
-                final_output += combined_output
+            if self.operation_mode == 'both':
+                operation_weight = self.operation_selectors[i](sum_output)
+                combined_output = torch.stack(phi_values, dim=0).prod(dim=0) * operation_weight + torch.stack(phi_values, dim=0).sum(dim=0) * (1 - operation_weight)
+            elif self.operation_mode == 'add':
+                combined_output = torch.stack(phi_values, dim=0).sum(dim=0)
+            elif self.operation_mode == 'mul':
+                combined_output = torch.stack(phi_values, dim=0).prod(dim=0)
+
+            final_output += combined_output
         
         final_output = self.final_layer(final_output)
         return final_output
 
-# custom loss function with regularization
-def custom_loss(predicted, true, model, lambda_reg=0.01):
+def initialize_weights(model):
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+def custom_loss(predicted, true, model, lambda_reg=0.001):
     mse_loss = nn.MSELoss()(predicted, true)
     reg_loss = sum(torch.sum(torch.abs(param)) for selector in model.operation_selectors for param in selector.parameters())
     return mse_loss + lambda_reg * reg_loss
 
-# training function
-def train_model(model, X, Y, epochs=1000, learning_rate=0.01, lambda_reg=0.01):
+def train_model(model, X, Y, epochs=1000, learning_rate=0.001, lambda_reg=0.001):
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     for epoch in range(epochs):
         model.train()
@@ -74,61 +74,71 @@ def train_model(model, X, Y, epochs=1000, learning_rate=0.01, lambda_reg=0.01):
         loss.backward()
         optimizer.step()
         if (epoch + 1) % 100 == 0:
-            print(f'epoch [{epoch+1}/{epochs}], loss: {loss.item():.4f}')
+            print(f'Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.4f}')
 
-# visualize all output elements of each layer with improved clarity
-def visualize_layer_outputs_all_elements(model, sample_input):
-    # pass the sample input through the shared_psi_layer to get hidden state
-    hidden_state = torch.relu(model.shared_psi_layer(sample_input))
-    
+def calculate_percentage_differences(model, X_test, Y_test, epsilon=1e-8):
     model.eval()
     with torch.no_grad():
-        plt.figure(figsize=(12, 8))
+        predictions = model(X_test).squeeze()
+        expected = Y_test.squeeze()
+        # Replace zeros in expected values with a small epsilon to avoid division by zero
+        expected = torch.where(expected == 0, torch.tensor(epsilon, dtype=expected.dtype), expected)
+        percentage_diff = torch.abs((predictions - expected) / expected) * 100
+    return percentage_diff.tolist()
+
+def compare_operation_modes(X_train, Y_train, X_test, Y_test, hidden_dim, epochs=1000, learning_rate=0.01):
+    modes = ['add', 'mul', 'both']
+    results = {}
+    percentage_diff_arrays = {'add': [], 'mul': [], 'both': []}
+
+    for mode in modes:
+        model = KANExtended(input_dim=2, output_dim=1, hidden_dim=hidden_dim, operation_mode=mode)
+        initialize_weights(model)
+        train_model(model, X_train, Y_train, epochs=epochs, learning_rate=learning_rate)
+        percentage_diff = calculate_percentage_differences(model, X_test, Y_test)
+        average_percentage_diff = sum(percentage_diff) / len(percentage_diff)
+
+        percentage_diff_arrays[mode] = percentage_diff  # Store percentage differences
+
+        model.eval()
+        with torch.no_grad():
+            predictions = model(X_test).squeeze().tolist()
+            inputs = X_test.tolist()
+            expected_outputs = Y_test.squeeze().tolist()
         
-        # Track the x-position for each bar in the graph
-        x_pos = 0
-        bar_width = 0.8  # width of the bars
-        
-        for i, output_layer in enumerate(model.output_layers):
-            # Get the output from each layer
-            layer_output = torch.relu(output_layer(hidden_state))
-            
-            # Visualize all elements in the output (assuming the output has 10 elements)
-            for j, output_value in enumerate(layer_output.squeeze().tolist()):
-                # Plot the bar for this element
-                plt.bar(x_pos, output_value, width=bar_width, color='b')
-                x_pos += 1
-        
-        # Label X-axis and Y-axis more clearly
-        plt.xlabel("Neurons in Each Layer (e.g., Layer 1 Neuron 1, Layer 1 Neuron 2, ...)", fontsize=12)
-        plt.ylabel("Neuron Activation (Output) Value", fontsize=12)
-        plt.title("Layer Outputs (Activation Values) for Input", fontsize=14)
-        
-        plt.show()
+        results[mode] = {
+            "average_percentage_diff": average_percentage_diff,
+            "percentage_differences": percentage_diff,
+            "predictions": predictions,
+            "inputs": inputs,
+            "expected_outputs": expected_outputs
+        }
 
+        print(f"\nMode: {mode}")
+        print("Inputs | Predictions | Expected Outputs | Percentage Difference")
+        for inp, pred, exp, diff in zip(inputs, predictions, expected_outputs, percentage_diff):
+            print(f"{inp} | {pred:.4f} | {exp:.4f} | {diff:.2f}%")
 
+    print("\nSummary of Results:")
+    for mode, result in results.items():
+        avg_diff = result['average_percentage_diff']
+        print(f"Operation Mode: {mode} - Average Percentage Difference: {avg_diff:.2f}%")
 
+    return percentage_diff_arrays
 
-
-# main function to test specific multiplication of 2 * 3 = 6
 def main():
-    # input is [2, 3] and expected output is 6 (2 * 3)
-    X = torch.tensor([[2.0, 3.0]])
-    Y = torch.tensor([[6.0]])
+    X_train = torch.rand(1000, 2) * 10  
+    Y_train = (X_train[:, 0] * X_train[:, 1]).unsqueeze(1)
 
-    # create and train the model
-    model = KANExtended(input_dim=2, output_dim=1, hidden_dim=10)
-    train_model(model, X, Y, epochs=1000, learning_rate=0.01)
-    
-    # test the model with the same input to see if it predicts 6
-    model.eval()
-    with torch.no_grad():
-        output = model(X)
-        print(f"input: {X.numpy()}, predicted output: {output.item()}, expected output: 6")
-    
-    # visualize the operation selection for this specific test
-    #visualize_layer_outputs_all_elements(model, X)
+    X_test = torch.rand(20, 2) * 10
+    Y_test = (X_test[:, 0] * X_test[:, 1]).unsqueeze(1)
 
-# run main
+    percentage_diff_arrays = compare_operation_modes(X_train, Y_train, X_test, Y_test, hidden_dim=10, epochs=500, learning_rate=0.001)
+
+    
+    for mode, diffs in percentage_diff_arrays.items():
+        avg_diff = sum(diffs) / len(diffs)
+        print(f"\nOverall Average Percentage Difference for {mode.capitalize()}: {avg_diff:.2f}%")
+
 if __name__ == "__main__":
     main()
